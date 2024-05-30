@@ -1,1 +1,9 @@
 .venv/*
+audio/*
+pickles/*
+loaded_save.pkl
+test.mp3
+test.png
+test.txt
+out.txt
+pyvenv.cfg
