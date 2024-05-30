@@ -5,7 +5,7 @@ import numpy as np
 import librosa
 import datetime
 import os
-from tensorflow import sparse
+from torch import sparse
 import pickle
 import multiprocessing
 
@@ -50,13 +50,13 @@ def frange(start,stop,step):
     
 def getCurveType(curveType):
     if(curveType == 'B'):
-        return 0b0001
+        return 0b0000
     elif(curveType == 'C'):
-        return 0b0010
+        return 0b0001
     elif(curveType == 'L'):
-        return 0b0100
+        return 0b0010
     elif(curveType == 'P'):
-        return 0b1000
+        return 0b0100
 
 def getCurvePts(curvePts):
     return [[int(x) for x in pt.split(':')] for pt in curvePts]
@@ -91,10 +91,10 @@ def getOutput(filename):
             objData = [int(x) for x in objData[:4]] + [curveType, int(objData[6]), float(objData[7][:-1]), 0]
         elif(int(objData[3]) & 0b00001000):
             # Spinner Data
-            objData = [int(x) for x in objData[:4]] + [getCurveType('L'), 0, 0, int(objData[5])]
+            objData = [int(x) for x in objData[:4]] + [getCurveType('B'), 0, 0, int(objData[5])]
         else:
             #Hit Circle Data
-            objData = [int(x) for x in objData[:4]] + [getCurveType('L'), 0, 0, 0] # Add dummy data for non-slider attribs
+            objData = [int(x) for x in objData[:4]] + [getCurveType('B'), 0, 0, 0] # Add dummy data for non-slider attribs
         target.append(objData)
     f.close()
     return target, sliderpts
@@ -121,9 +121,12 @@ def formatOutput(filename):
         while(len(sliderpts[i]) < maxlen):
             sliderpts[i].append([0,0])
 
-    print(newTarget)
-    if len(sliderpts) > 0: return sparse.from_dense(np.stack(tuple(newTarget), axis=0)), sparse.from_dense(np.stack(tuple(sliderpts), axis=0))
-    return sparse.from_dense(np.stack(tuple(newTarget), axis=0)), sparse.from_dense([])
+    newTarget = torch.tensor(np.stack(tuple(newTarget), axis=0)).to_sparse_csr() 
+    if len(sliderpts) > 0:  
+        sliderpts = torch.tensor(np.stack(tuple(sliderpts), axis=0)).to_sparse_csr()
+    else: sliderpts = torch.tensor([]).to_sparse_csr()
+    
+    return newTarget, sliderpts
 
 
 def process_file(file):
