@@ -107,7 +107,7 @@ def formatOutput(filename):
     if len(target) == 0 or len(target[0]) == 0:
         tsprint("ERROR: Insufficient data for hitpoints.")
         return
-    for t in range(0, target[-1][2] + 1):
+    for t in range(0, target[-1][2] + 1, 10):
         if(pos < len(target) and target[pos][2] == t):
             newTarget.append(target[pos])
             newTarget[-1][2] = 1
