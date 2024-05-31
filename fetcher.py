@@ -84,7 +84,7 @@ if __name__ == "__main__":
     tsprint("Starting download of 10000 maps")
     # Download maps in parallel
     while True:
-        if get_file_count(extract_path_maps) > 10000:
+        if get_file_count(extract_path_maps) > 10:
             break
         with ThreadPoolExecutor() as executor:
             # Submit downloadMap function for each map ID

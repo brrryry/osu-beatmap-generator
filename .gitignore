@@ -1,6 +1,7 @@
 .venv/*
 audio/*
 pickles/*
+maps/*
 loaded_save.pkl
 test.mp3
 test.png

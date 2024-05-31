@@ -5,7 +5,7 @@ import numpy as np
 import librosa
 import datetime
 import os
-from torch import sparse
+import torch
 import pickle
 import multiprocessing
 
@@ -123,8 +123,9 @@ def formatOutput(filename):
 
     newTarget = torch.tensor(np.stack(tuple(newTarget), axis=0)).to_sparse_csr() 
     if len(sliderpts) > 0:  
-        sliderpts = torch.tensor(np.stack(tuple(sliderpts), axis=0)).to_sparse_csr()
-    else: sliderpts = torch.tensor([]).to_sparse_csr()
+        sliderpts = torch.tensor(np.stack(tuple(sliderpts), axis=0)).to_sparse()
+    else: 
+        sliderpts = torch.tensor([]).to_sparse()
     
     return newTarget, sliderpts
 
