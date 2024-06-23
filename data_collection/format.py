@@ -88,7 +88,11 @@ def getOutput(filename):
             curveType = getCurveType(sliderData[0])
             sliderpts.append(getCurvePts(sliderData[1:]))
 
-            objData = [int(x) for x in objData[:4]] + [curveType, int(objData[6]), float(objData[7][:-1]), 0]
+            try:
+                objData = [int(x) for x in objData[:4]] + [curveType, int(objData[6]), float(objData[7][:-1]), 0]
+            except:
+                tsprint("ERROR: Insufficient data for slider.")
+                return [], []
         elif(int(objData[3]) & 0b00001000):
             # Spinner Data
             objData = [int(x) for x in objData[:4]] + [getCurveType('B'), 0, 0, int(objData[5])]
@@ -106,7 +110,10 @@ def formatOutput(filename):
     newTarget = [] 
     if len(target) == 0 or len(target[0]) == 0:
         tsprint("ERROR: Insufficient data for hitpoints.")
+        os.remove(filename.split(".")[0] + ".osu")
+        if os.path.isfile(filename.split("_")[0] + ".mp3"): os.remove(filename.split("_")[0] + ".mp3")
         return
+
     for t in range(0, target[-1][2] + 1, 10):
         if(pos < len(target) and target[pos][2] == t):
             newTarget.append(target[pos])
