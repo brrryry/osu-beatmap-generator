@@ -17,6 +17,8 @@ import torch
 import numpy as np
 import librosa
 import pickle
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 # Our imports
 import config #config file
@@ -29,13 +31,19 @@ extract_path_pickles = config.pickle_path
 ##################
 # Helper Functions
 ##################
+def get_file_count(path: str) -> int:
+    """
+    Given a path, return the number of files in that path.
+    """
+    return len(os.listdir(path))
+
 def tsprint(s):
     """
     Prints a string with a timestamp in front of it.
     """
     print("[" + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "] " + s)
 
-def parse_difficulty(lines: [str]) -> list:
+def parse_difficulty(lines):
     """
     Parses the difficulty of an osu! map.
     @param lines: The lines of the osu! map file.
@@ -77,18 +85,19 @@ def remove_osu_map_files(id):
     except:
         tsprint("Error removing audio with ID " + id)
 
-def curve_letter_to_bin(letter: str) -> int:
+def get_curve_type(letter: str) -> int:
     """
     Converts a curve letter to its binary component
     """
-    if(curveType == 'B'):
-        return 0b0000
-    elif(curveType == 'C'):
+    if(letter == 'B'):
         return 0b0001
-    elif(curveType == 'L'):
+    elif(letter == 'C'):
         return 0b0010
-    elif(curveType == 'P'):
+    elif(letter == 'L'):
         return 0b0100
+    elif(letter == 'P'):
+        return 0b1000
+
 
 def get_curve_points(curvePts):
     """
@@ -101,12 +110,12 @@ def get_curve_points(curvePts):
 # Main Functions
 ##################
 
-def getOutput():
+def getOutput(filename):
     """
     Given a file, parse it and return each of its hitobjects/sliders in a list format.
     """
     # Open the file
-    f = open(filename, 'r')
+    f = open(filename, 'r', encoding='utf-8')
 
     # Go to the file position where HitObjects start
     while("HitObject" not in f.readline()):
@@ -128,8 +137,8 @@ def getOutput():
         if(int(objData[3]) & 0b00000010):
             # Slider data
             sliderData = objData[5].split('|')
-            curveType = getCurveType(sliderData[0])
-            sliderpts.append(getCurvePts(sliderData[1:]))
+            curveType = get_curve_type(sliderData[0])
+            sliderpts.append(get_curve_points(sliderData[1:]))
 
             try:
                 objData = [int(x) for x in objData[:4]] + [curveType, int(objData[6]), float(objData[7][:-1]), 0]
@@ -138,10 +147,10 @@ def getOutput():
                 return [], []
         elif(int(objData[3]) & 0b00001000):
             # Spinner Data
-            objData = [int(x) for x in objData[:4]] + [getCurveType('B'), 0, 0, int(objData[5])]
+            objData = [int(x) for x in objData[:4]] + [get_curve_type('B'), 0, 0, int(objData[5])]
         else:
             #Hit Circle Data
-            objData = [int(x) for x in objData[:4]] + [getCurveType('B'), 0, 0, 0] # Add dummy data for non-slider attribs
+            objData = [int(x) for x in objData[:4]] + [get_curve_type('B'), 0, 0, 0] # Add dummy data for non-slider attribs
         target.append(objData)
     f.close()
     return target, sliderpts
@@ -177,6 +186,13 @@ def formatOutput(filename):
         output.append(obj)
 
     return output
+
+def process_file(file):
+    if file.endswith(".osu"):
+        tsprint("Starting file processing for " + file)
+        out = formatOutput(extract_path_maps + file)
+        pickle.dump(out, open(extract_path_pickles + file[:-4] + ".pkl", "wb"))
+        tsprint("Finished file processing for " + file)
 
 def downloadMap(id):
     """
@@ -275,4 +291,4 @@ def collect_data(num_maps=1000):
     tsprint(f'Downloaded {num_maps} maps!')
 
 if __name__ == "__main__":
-    collect_data(1000)
+    collect_data(500)
