@@ -156,36 +156,31 @@ def getOutput(filename):
     return target, sliderpts
 
 def formatOutput(filename):
-    """
-    Given a filename, get the output using getOutput() and format it in centisecond intervals.
-    """
     # Get the output
     target, sliderpts = getOutput(filename)
     pos = 0
-
-    # If there is no data, return nothing
-    if not target:
-        return None
-
-    # Create the output
-    output = []
-    for i in range(len(target)):
-        # Get the current object
-        obj = target[i]
-
-        # If the object is a slider
-        if obj[3] & 0b00000010:
-            # Get the slider points
-            pts = sliderpts[pos]
+    newTarget = [] 
+    if len(target) == 0 or len(target[0]) == 0:
+        tsprint("ERROR: Insufficient data for hitpoints.")
+        return
+    for t in range(0, target[-1][2] + 1):
+        if(pos < len(target) and target[pos][2] == t):
+            newTarget.append(target[pos])
+            newTarget[-1][2] = 1
             pos += 1
+        else:
+            newTarget.append([0,0,0,0,0,0,0,0])
 
-            # Add the slider points to the object
-            obj = obj + pts
 
-        # Add the object to the output
-        output.append(obj)
+    maxlen = max([len(x) for x in sliderpts]) if len(sliderpts) > 0 else 0
+    for i in range(len(sliderpts)):
+        while(len(sliderpts[i]) < maxlen):
+            sliderpts[i].append([0,0])
 
-    return output
+    print(newTarget)
+    if len(sliderpts) > 0: return sparse.from_dense(np.stack(tuple(newTarget), axis=0)), sparse.from_dense(np.stack(tuple(sliderpts), axis=0))
+    return sparse.from_dense(np.stack(tuple(newTarget), axis=0)), sparse.from_dense([])
+
 
 def process_file(file):
     if file.endswith(".osu"):
