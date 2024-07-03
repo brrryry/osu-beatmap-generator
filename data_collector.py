@@ -177,9 +177,13 @@ def formatOutput(filename):
         while(len(sliderpts[i]) < maxlen):
             sliderpts[i].append([0,0])
 
-    print(newTarget)
-    if len(sliderpts) > 0: return sparse.from_dense(np.stack(tuple(newTarget), axis=0)), sparse.from_dense(np.stack(tuple(sliderpts), axis=0))
-    return sparse.from_dense(np.stack(tuple(newTarget), axis=0)), sparse.from_dense([])
+    newTarget = torch.tensor(np.stack(tuple(newTarget), axis=0)).to_sparse_csr() 
+    if len(sliderpts) > 0:  
+        sliderpts = torch.tensor(np.stack(tuple(sliderpts), axis=0)).to_sparse()
+    else: 
+        sliderpts = torch.tensor([]).to_sparse()
+    
+    return newTarget, sliderpts
 
 
 def process_file(file):
