@@ -10,10 +10,14 @@ models/*
 pickles/*
 audio/*
 maps/*
+spectrograms/*
+spectrograms_256/*
+processed_maps.txt
 decoder.pth
 encoder.pth
 logs/*
 test_audio/*
+*.pth
 
 # Ignore Jupyter Notebook checkpoints
 .ipynb_checkpoints
