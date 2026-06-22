@@ -35,7 +35,7 @@ try:
     import config
     DEFAULT_AUDIO_DIR = config.audio_path
 except ImportError:
-    DEFAULT_AUDIO_DIR = "audio/"
+    DEFAULT_AUDIO_DIR = "data/audio/"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert collected audio files to spectrogram NumPy arrays.")
@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="spectrograms",
+        default="data/spectrograms",
         help="Directory to save spectrograms (default: spectrograms/)"
     )
     parser.add_argument(

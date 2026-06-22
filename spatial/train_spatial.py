@@ -18,6 +18,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 
+# Add project directories to sys.path to support imports under the new layout
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+rhythm_dir = os.path.join(project_root, 'rhythm')
+if rhythm_dir not in sys.path:
+    sys.path.append(rhythm_dir)
+spatial_dir = os.path.join(project_root, 'spatial')
+if spatial_dir not in sys.path:
+    sys.path.append(spatial_dir)
+
 # Our imports
 from spatial_model import CNNLSTMSpatialModel, LSTMSpatialModel, TransformerSpatialModel
 from train_rhythm import OsuBeatmapParser
@@ -293,7 +304,7 @@ def loss_fn(pred, target, actual_lens):
     
     return total_loss, dir_loss.item(), dist_loss.item()
 
-def train_epoch(model, dataloader, optimizer, device):
+def train_epoch(model, dataloader, optimizer, device, teacher_forcing_ratio=1.0):
     model.train()
     total_loss = 0
     total_dir_loss = 0
@@ -304,7 +315,10 @@ def train_epoch(model, dataloader, optimizer, device):
         targets = targets.to(device)
         
         optimizer.zero_grad()
-        preds = model(features)
+        if isinstance(model, TransformerSpatialModel):
+            preds = model(features)
+        else:
+            preds = model(features, targets=targets, teacher_forcing_ratio=teacher_forcing_ratio)
         
         loss, dir_l, dist_l = loss_fn(preds, targets, lengths)
         loss.backward()
@@ -457,7 +471,10 @@ def main():
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
         
-        train_loss, train_dir, train_dist = train_epoch(model, train_loader, optimizer, device)
+        # Linearly decay teacher forcing ratio from 1.0 to 0.2
+        tf_ratio = max(0.2, 1.0 - (epoch - 1) / args.epochs)
+        
+        train_loss, train_dir, train_dist = train_epoch(model, train_loader, optimizer, device, teacher_forcing_ratio=tf_ratio)
         val_loss, val_dir, val_dist, mean_dist_err, mean_ang_err = evaluate(model, val_loader, device)
         
         scheduler.step()

@@ -22,7 +22,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+
+# Add project directories to sys.path to support imports under the new layout
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+rhythm_dir = os.path.join(project_root, 'rhythm')
+if rhythm_dir not in sys.path:
+    sys.path.append(rhythm_dir)
+spatial_dir = os.path.join(project_root, 'spatial')
+if spatial_dir not in sys.path:
+    sys.path.append(spatial_dir)
 
 # Our imports
 from rhythm_model import CNNLSTMRhythmModel, TransformerRhythmModel, CNNTransformerRhythmModel, load_model_helper
@@ -308,9 +319,9 @@ def assign_pattern_labels(hit_objects, timing_points):
                 hit_objects[idx]['pattern_class'] = 1
         elif L == 3:
             # Triplet
-            hit_objects[burst[0]]['pattern_class'] = 7  # B-Triplet
-            hit_objects[burst[1]]['pattern_class'] = 8  # I-Triplet
-            hit_objects[burst[2]]['pattern_class'] = 8  # I-Triplet
+            hit_objects[burst[0]]['pattern_class'] = 7  # Triplet
+            hit_objects[burst[1]]['pattern_class'] = 7  # Triplet
+            hit_objects[burst[2]]['pattern_class'] = 7  # Triplet
         else:
             # Stream
             hit_objects[burst[0]]['pattern_class'] = 5  # B-Stream
@@ -319,9 +330,76 @@ def assign_pattern_labels(hit_objects, timing_points):
                 
     return hit_objects
 
+def get_map_metadata_vector(map_path, timing_points, hit_objects, sr=11025, hop_length=256):
+    # Calculate density (objects per second)
+    song_duration_sec = 0.0
+    if len(hit_objects) > 0:
+        max_time = max(ho['end_time'] for ho in hit_objects)
+        song_duration_sec = max_time / 1000.0
+        
+    density = len(hit_objects) / song_duration_sec if song_duration_sec > 0.0 else 0.0
+    
+    # Parse basic difficulty parameters from the file
+    meta = OsuBeatmapParser.parse_metadata(map_path)
+    
+    # Heuristic for Star Rating (SR)
+    od = meta.get('od', 5.0)
+    ar = meta.get('ar', 5.0)
+    estimated_sr = 0.5 * density + 0.15 * od + 0.15 * ar + 0.5
+    
+    # Classify into 5 difficulty groups:
+    # 0: 1-3 stars
+    # 1: 3-4.5 stars
+    # 2: 4.5-6 stars
+    # 3: 6-8 stars
+    # 4: 8-10+ stars
+    if estimated_sr < 3.0:
+        diff_group = 0
+    elif estimated_sr < 4.5:
+        diff_group = 1
+    elif estimated_sr < 6.0:
+        diff_group = 2
+    elif estimated_sr < 8.0:
+        diff_group = 3
+    else:
+        diff_group = 4
+        
+    # Classify style tag: stream, jump, tech, balanced
+    total = len(hit_objects)
+    if total == 0:
+        style = "jump"
+    else:
+        num_sliders = sum(1 for ho in hit_objects if ho['type'] == 'slider')
+        num_stream = sum(1 for ho in hit_objects if ho.get('pattern_class', 1) in [5, 6, 7])
+        num_jump = sum(1 for ho in hit_objects if ho.get('pattern_class', 1) == 1)
+        
+        stream_ratio = num_stream / total
+        jump_ratio = num_jump / total
+        slider_ratio = num_sliders / total
+        
+        if slider_ratio > 0.35 and stream_ratio > 0.1:
+            style = "tech"
+        elif stream_ratio > 0.25:
+            style = "stream"
+        elif jump_ratio > 0.45:
+            style = "jump"
+        else:
+            style = "balanced"
+            
+    # Encode as one-hot for difficulty
+    diff_one_hot = np.zeros(5, dtype=np.float32)
+    diff_one_hot[diff_group] = 1.0
+    
+    # Encode style as three continuous float confidence values: [jump_ratio, stream_ratio, slider_ratio]
+    style_vars = np.array([jump_ratio, stream_ratio, slider_ratio], dtype=np.float32)
+    
+    # Combine into 8-dimensional vector (5 diff + 3 style)
+    meta_vec = np.concatenate([diff_one_hot, style_vars])
+    return meta_vec, estimated_sr, style
+
 class OsuRhythmDataset(Dataset):
     """Custom Dataset aligning spectrograms and Osu! beatmaps."""
-    def __init__(self, maps_dir, spec_dir, sr=11025, hop_length=512, chunk_size=512, onset_width=3, is_train=True, num_classes=9, mapset_ids=None):
+    def __init__(self, maps_dir, spec_dir, sr=11025, hop_length=512, chunk_size=512, onset_width=3, is_train=True, num_classes=6, mapset_ids=None, cache=False):
         self.maps_dir = maps_dir
         self.spec_dir = spec_dir
         self.sr = sr
@@ -331,6 +409,7 @@ class OsuRhythmDataset(Dataset):
         self.is_train = is_train
         self.num_classes = num_classes
         self.mapset_ids = mapset_ids
+        self.cache_enabled = cache
         self.cache = {}
         
         self.valid_pairs = []
@@ -425,7 +504,14 @@ class OsuRhythmDataset(Dataset):
             if ho['type'] == 'circle':
                 f = int(round(ho['start_time'] * self.sr / (self.hop_length * 1000.0)))
                 label_val = ho.get('pattern_class', 1)
-                if self.num_classes == 5 and label_val > 4:
+                if self.num_classes == 5:
+                    if label_val in [5, 6, 7]:
+                        label_val = 3  # Stream
+                    else:
+                        label_val = 1  # Circle O
+                elif self.num_classes == 6 and label_val in [5, 6, 7]:
+                    label_val = 5
+                elif label_val > 4:
                     label_val = 1
                 place_label(f, label_val)
             # Slider (Start: 2, End: 3)
@@ -433,7 +519,8 @@ class OsuRhythmDataset(Dataset):
                 fs = int(round(ho['start_time'] * self.sr / (self.hop_length * 1000.0)))
                 fe = int(round(ho['end_time'] * self.sr / (self.hop_length * 1000.0)))
                 place_label(fs, 2)
-                place_label(fe, 3)
+                if self.num_classes != 5:
+                    place_label(fe, 3)
             # Spinner (Class 4)
             elif ho['type'] == 'spinner':
                 f = int(round(ho['start_time'] * self.sr / (self.hop_length * 1000.0)))
@@ -443,23 +530,8 @@ class OsuRhythmDataset(Dataset):
         import librosa
         S_delta = librosa.feature.delta(S, axis=1)
         
-        # Parse difficulty metadata
-        meta = OsuBeatmapParser.parse_metadata(pair['map_path'])
-        
-        # Calculate overall density of hitobjects per second
-        song_duration_sec = song_duration_ms / 1000.0
-        density = len(hit_objects) / song_duration_sec if song_duration_sec > 0.0 else 0.0
-        
-        # Combine into a metadata vector
-        meta_vec = np.array([
-            meta['hp'],
-            meta['cs'],
-            meta['od'],
-            meta['ar'],
-            meta['sm'],
-            meta['str'],
-            density
-        ], dtype=np.float32)
+        # Parse difficulty and style metadata
+        meta_vec, estimated_sr, style = get_map_metadata_vector(pair['map_path'], timing_points, hit_objects, sr=self.sr, hop_length=self.hop_length)
         
         # Replicate metadata features across all frames
         meta_grid = np.tile(meta_vec, (n_frames, 1))
@@ -467,27 +539,29 @@ class OsuRhythmDataset(Dataset):
         # Concatenate Mel, Delta Mel, timing line, and difficulty metadata
         features = np.vstack([S, S_delta, timing_line.reshape(1, -1)]) # shape (169, n_frames)
         features = features.T # shape (n_frames, 169)
-        features = np.hstack([features, meta_grid]) # shape (n_frames, 176)
+        features = np.hstack([features, meta_grid]) # shape (n_frames, 177)
         
         return torch.tensor(features, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
 
     def get_labels(self, idx):
         # Light parsing to compute label distribution
-        if idx in self.cache:
+        if self.cache_enabled and idx in self.cache:
             _, labels = self.cache[idx]
         else:
             pair = self.valid_pairs[idx]
             features, labels = self._generate_features_and_labels(pair)
-            self.cache[idx] = (features, labels)
+            if self.cache_enabled:
+                self.cache[idx] = (features, labels)
         return labels.numpy()
 
     def __getitem__(self, idx):
-        if idx in self.cache:
+        if self.cache_enabled and idx in self.cache:
             features, labels = self.cache[idx]
         else:
             pair = self.valid_pairs[idx]
             features, labels = self._generate_features_and_labels(pair)
-            self.cache[idx] = (features, labels)
+            if self.cache_enabled:
+                self.cache[idx] = (features, labels)
             
         n_frames = features.shape[0]
         
@@ -509,16 +583,16 @@ class OsuRhythmDataset(Dataset):
 
 def compute_class_weights(dataset, num_classes=9, max_weight=20.0, method="square_root"):
     """Computes class weights based on labels in the training subset."""
-    print(f"Computing class weights using '{method}' method and caching dataset...")
+    print(f"Computing class weights using '{method}' method...")
     class_counts = np.zeros(num_classes)
     total_len = len(dataset)
     for idx in range(total_len):
         if idx % 500 == 0:
-            print(f"  Progress: {idx}/{total_len} files cached...")
-        _, labels = dataset[idx]
+            print(f"  Progress: {idx}/{total_len} files processed...")
+        labels = dataset.get_labels(idx)
         for c in range(num_classes):
-            class_counts[c] += torch.sum(labels == c).item()
-    print(f"  Progress: {total_len}/{total_len} files cached.")
+            class_counts[c] += np.sum(labels == c)
+    print(f"  Progress: {total_len}/{total_len} files processed.")
             
     # Avoid division by zero
     class_counts = np.maximum(class_counts, 1)
@@ -528,18 +602,33 @@ def compute_class_weights(dataset, num_classes=9, max_weight=20.0, method="squar
         weights = 1.0 / np.sqrt(class_counts)
         # Normalize so that the minimum weight (None class) is 1.0
         weights = weights / np.min(weights)
+        
+        # Binary onset weights
+        no_onset_count = class_counts[0]
+        onset_count = np.sum(class_counts[1:])
+        onset_weights = 1.0 / np.sqrt([no_onset_count, onset_count])
+        onset_weights = onset_weights / np.min(onset_weights)
     elif method == "inverse":
         # Standard inverse frequency
         total = np.sum(class_counts)
         weights = total / (float(num_classes) * class_counts)
+        
+        # Binary onset weights
+        no_onset_count = class_counts[0]
+        onset_count = np.sum(class_counts[1:])
+        total_onset = no_onset_count + onset_count
+        onset_weights = total_onset / (2.0 * np.array([no_onset_count, onset_count]))
+        onset_weights = onset_weights / np.min(onset_weights)
     else:
         # Uniform weights
         weights = np.ones(num_classes)
+        onset_weights = np.ones(2)
         
     if max_weight is not None:
         weights = np.minimum(weights, max_weight)
+        onset_weights = np.minimum(onset_weights, max_weight)
         
-    return torch.tensor(weights, dtype=torch.float)
+    return torch.tensor(weights, dtype=torch.float), torch.tensor(onset_weights, dtype=torch.float)
 
 def snap_to_grid(time_ms, timing_points, allowed_subdivisions=[1, 2, 4]):
     """
@@ -590,10 +679,12 @@ def collate_fn_eval(batch):
     # Batch size is 1 for full sequence validation/eval
     return batch[0][0].unsqueeze(0), batch[0][1].unsqueeze(0)
 
-def train_epoch(model, dataloader, optimizer, criterion, device):
+def train_epoch(model, dataloader, optimizer, criterion_onset, device, type_weights=None, label_smoothing=0.0, clip_grad=1.0):
     model.train()
     total_loss = 0
     total_batches = len(dataloader)
+    
+    import torch.nn.functional as F
     
     for batch_idx, (features, labels) in enumerate(dataloader):
         if batch_idx % 50 == 0:
@@ -602,19 +693,41 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         labels = labels.to(device)
         
         optimizer.zero_grad()
-        logits = model(features)
+        logits_onset, logits_type = model(features)
         
-        # Reshape logits to (Batch * SeqLen, Classes) and labels to (Batch * SeqLen)
-        loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+        # 1. Onset Loss (binary classification: None vs Note)
+        target_onset = (labels > 0).long()
+        loss_onset = criterion_onset(logits_onset.view(-1, 2), target_onset.view(-1))
+        
+        # 2. Note Type Loss with Binary Mask multiplication
+        mask = (labels > 0).float().view(-1)
+        target_type = torch.clamp(labels - 1, min=0).view(-1)
+        
+        loss_type_elementwise = F.cross_entropy(
+            logits_type.view(-1, logits_type.size(-1)),
+            target_type,
+            weight=type_weights,
+            reduction='none',
+            label_smoothing=label_smoothing
+        )
+        
+        if mask.sum() > 0:
+            loss_type = (loss_type_elementwise * mask).sum() / mask.sum()
+        else:
+            loss_type = torch.tensor(0.0, device=device)
+            
+        loss = loss_onset + loss_type
         
         loss.backward()
+        if clip_grad > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         optimizer.step()
         
         total_loss += loss.item()
         
     return total_loss / len(dataloader)
 
-def evaluate_model(model, dataloader, device, num_classes=9):
+def evaluate_model(model, dataloader, device, num_classes=8):
     model.eval()
     all_preds = []
     all_targets = []
@@ -622,19 +735,32 @@ def evaluate_model(model, dataloader, device, num_classes=9):
     with torch.no_grad():
         for features, labels in dataloader:
             features = features.to(device)
-            logits = model(features)
-            preds = torch.argmax(logits, dim=-1)
+            logits_onset, logits_type = model(features)
+            
+            probs_onset = torch.softmax(logits_onset, dim=-1)
+            probs_type = torch.softmax(logits_type, dim=-1)
+            
+            # Hierarchical prediction: onset exists if P(onset) >= 0.5
+            pred_onset = torch.argmax(probs_onset, dim=-1)
+            pred_type = torch.argmax(probs_type, dim=-1) + 1
+            preds = torch.where(pred_onset > 0, pred_type, torch.zeros_like(pred_onset))
             
             all_preds.extend(preds.view(-1).cpu().numpy())
-            all_targets.extend(labels.view(-1).numpy())
+            all_targets.extend(labels.view(-1).cpu().numpy())
             
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
     
     print("\nClassification Report (Sequence Frame-level):")
     if num_classes == 5:
-        target_names = ["None", "Circle", "Slider Start", "Slider End", "Spinner"]
+        target_names = ["None", "Circle O", "Slider Start", "Stream", "Spinner"]
         labels = [0, 1, 2, 3, 4]
+    elif num_classes == 6:
+        target_names = ["None", "Circle O", "Slider Start", "Slider End", "Spinner", "Stream"]
+        labels = [0, 1, 2, 3, 4, 5]
+    elif num_classes == 8:
+        target_names = ["None", "Circle O", "Slider Start", "Slider End", "Spinner", "B-Stream", "I-Stream", "Triplet"]
+        labels = [0, 1, 2, 3, 4, 5, 6, 7]
     else:
         target_names = ["None", "Circle O", "Slider Start", "Slider End", "Spinner", "B-Stream", "I-Stream", "B-Triplet", "I-Triplet"]
         labels = [0, 1, 2, 3, 4, 5, 6, 7, 8]
@@ -652,12 +778,48 @@ def evaluate_model(model, dataloader, device, num_classes=9):
     else:
         print("No onset events found in evaluation set.")
 
+
+class DualLogger:
+    """Redirects stdout to both the console and a file."""
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        self.log_file = open(filepath, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+
+class DualErrorLogger:
+    """Redirects stderr to both the console and a file."""
+    def __init__(self, filepath):
+        self.terminal = sys.stderr
+        self.log_file = open(filepath, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train rhythm generation temporal transcription model.")
     parser.add_argument("--maps_dir", type=str, default="maps", help="Maps directory path")
     parser.add_argument("--spec_dir", type=str, default="spectrograms", help="Spectrograms directory path")
     parser.add_argument("--model_type", type=str, choices=["cnn-lstm", "transformer", "cnn-transformer"], default="cnn-lstm", help="Model architecture")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--patience", type=int, default=20, help="Patience epochs for early stopping (default: 20)")
+    parser.add_argument("--clip_grad", type=float, default=1.0, help="Max norm of gradients for gradient clipping (default: 1.0, set <= 0 to disable)")
+    parser.add_argument("--custom_weights", type=float, nargs="+", default=None, help="Custom class weights to override computed/fallback weights (e.g. 1.0 2.5 2.6 4.0 5.0)")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--chunk_size", type=int, default=512, help="Sequence chunk size for training")
@@ -667,8 +829,8 @@ def main():
     parser.add_argument("--evaluate", action="store_true", help="Only run evaluation using saved checkpoint")
     parser.add_argument("--predict_npy", type=str, default=None, help="Path to a spectrogram .npy file to transcribe")
     parser.add_argument("--timing_osu", type=str, default=None, help="Optional path to a .osu file to extract timing points for grid snapping")
-    parser.add_argument("--max_weight", type=float, default=20.0, help="Maximum class weight cap to avoid rare classes dominating")
-    parser.add_argument("--num_classes", type=int, default=9, help="Number of classes (5 for legacy, 9 for patterns)")
+    parser.add_argument("--max_weight", type=float, default=5.0, help="Maximum class weight cap to avoid rare classes dominating")
+    parser.add_argument("--num_classes", type=int, default=5, help="Number of classes (5 for None/Circle O/Slider Start/Stream/Spinner, 6 for legacy consolidated, 8 for pattern consolidation)")
     parser.add_argument("--num_bands", type=int, default=3, choices=[1, 2, 3, 4, 6, 7, 12, 14, 21, 28, 42, 84], help="Number of bands to split the 84 frequency bins into for Channel Attention (default: 3)")
     parser.add_argument("--weight_method", type=str, choices=["inverse", "square_root", "none"], default="square_root", help="Method to calculate class weights for balancing class representation (default: square_root)")
     parser.add_argument("--label_smoothing", type=float, default=0.05, help="Label smoothing value for CrossEntropyLoss (default: 0.05)")
@@ -677,8 +839,30 @@ def main():
     parser.add_argument("--hop_length", type=int, default=512, help="Spectrogram hop length (default: 512)")
     parser.add_argument("--use_focal_loss", action="store_true", help="Use Focal Loss instead of CrossEntropyLoss")
     parser.add_argument("--focal_gamma", type=float, default=2.0, help="Gamma parameter for Focal Loss (default: 2.0)")
+    parser.add_argument("--cache_dataset", action="store_true", help="Cache preprocessed dataset in RAM (not recommended for large datasets)")
+    parser.add_argument("--on_exist", type=str, default="ask", choices=["ask", "load", "overwrite"], help="Action if save_path checkpoint already exists: 'ask' (default), 'load' (resume training), or 'overwrite' (start from scratch)")
     
     args = parser.parse_args()
+    
+    # Set up unique logging for training runs
+    if not args.predict_npy and not args.evaluate:
+        import datetime
+        log_dir = "data/logs/rhythm_models"
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"run_{timestamp}_{args.model_type}.log"
+        log_filepath = os.path.join(log_dir, log_filename)
+        
+        sys.stdout = DualLogger(log_filepath)
+        sys.stderr = DualErrorLogger(log_filepath)
+        
+        print(f"Logging this training run to: {log_filepath}")
+        
+    print("=" * 50)
+    print("Configuration Arguments:")
+    for arg, value in vars(args).items():
+        print(f"  {arg}: {value}")
+    print("=" * 50)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -781,22 +965,18 @@ def main():
             expected_dim = model.attention.input_dim
             
         if expected_dim > 169:
-            # Parse difficulty metadata if timing_osu is available, else use default values
-            meta = OsuBeatmapParser.parse_metadata(args.timing_osu) if args.timing_osu else {
-                'hp': 5.0, 'cs': 4.0, 'od': 5.0, 'ar': 5.0, 'sm': 1.4, 'str': 1.0
-            }
-            # Density defaults to 0.0 in predict mode if no hit objects parsed
-            density = 0.0
-            if args.timing_osu:
-                try:
-                    _, hit_objects, _ = OsuBeatmapParser.parse(args.timing_osu)
-                    song_duration_sec = song_duration_ms / 1000.0
-                    density = len(hit_objects) / song_duration_sec if song_duration_sec > 0.0 else 0.0
-                except Exception:
-                    pass
-            meta_vec = np.array([
-                meta['hp'], meta['cs'], meta['od'], meta['ar'], meta['sm'], meta['str'], density
-            ], dtype=np.float32)
+            # Parse difficulty metadata and classify into difficulty group and style tag
+            if args.timing_osu and os.path.exists(args.timing_osu):
+                timing_points, hit_objects, _ = OsuBeatmapParser.parse(args.timing_osu)
+                meta_vec, _, _ = get_map_metadata_vector(args.timing_osu, timing_points, hit_objects, sr=sr, hop_length=hop_length)
+            else:
+                # Default: 4.5-6 stars (Group 2), Jump style (Group 1)
+                diff_one_hot = np.zeros(5, dtype=np.float32)
+                diff_one_hot[2] = 1.0
+                style_one_hot = np.zeros(3, dtype=np.float32)
+                style_one_hot[1] = 1.0
+                meta_vec = np.concatenate([diff_one_hot, style_one_hot])
+                
             meta_grid = np.tile(meta_vec, (n_frames, 1))
             features = np.hstack([features, meta_grid])
             
@@ -804,8 +984,17 @@ def main():
         
         print("Transcribing rhythm...")
         with torch.no_grad():
-            logits = model(features_tensor)
-            preds = torch.argmax(logits, dim=-1).squeeze(0).cpu().numpy()
+            logits_onset, logits_type = model(features_tensor)
+            probs_onset = torch.softmax(logits_onset, dim=-1)
+            probs_type = torch.softmax(logits_type, dim=-1)
+            
+            # Reconstruct joint probabilities
+            batch_size, seq_len, _ = probs_onset.shape
+            probs_all = torch.zeros((batch_size, seq_len, args.num_classes), device=probs_onset.device)
+            probs_all[:, :, 0] = probs_onset[:, :, 0]
+            probs_all[:, :, 1:] = probs_onset[:, :, 1].unsqueeze(-1) * probs_type
+            
+            preds = torch.argmax(probs_all, dim=-1).squeeze(0).cpu().numpy()
             
         # Decode and print events with grid snapping
         print("\nPredicted Rhythm Events:")
@@ -813,7 +1002,11 @@ def main():
         print(f"{'Frame':<8} | {'Raw Time':<12} | {'Snapped Time':<12} | {'Snapped Diff':<12} | {'Event':<15}")
         print("----------------------------------------------------------------------")
         if args.num_classes == 5:
-            classes = ["None", "Circle", "Slider Start", "Slider End", "Spinner"]
+            classes = ["None", "Circle O", "Slider Start", "Stream", "Spinner"]
+        elif args.num_classes == 6:
+            classes = ["None", "Circle O", "Slider Start", "Slider End", "Spinner", "Stream"]
+        elif args.num_classes == 8:
+            classes = ["None", "Circle O", "Slider Start", "Slider End", "Spinner", "B-Stream", "I-Stream", "Triplet"]
         else:
             classes = ["None", "Circle O", "Slider Start", "Slider End", "Spinner", "B-Stream", "I-Stream", "B-Triplet", "I-Triplet"]
         
@@ -863,7 +1056,8 @@ def main():
         is_train=True,
         num_classes=args.num_classes,
         mapset_ids=train_mapset_ids,
-        hop_length=args.hop_length
+        hop_length=args.hop_length,
+        cache=args.cache_dataset
     )
     val_dataset = OsuRhythmDataset(
         maps_dir=args.maps_dir,
@@ -872,7 +1066,8 @@ def main():
         is_train=False,
         num_classes=args.num_classes,
         mapset_ids=val_mapset_ids,
-        hop_length=args.hop_length
+        hop_length=args.hop_length,
+        cache=args.cache_dataset
     )
     
     if len(train_dataset) == 0:
@@ -880,7 +1075,7 @@ def main():
         sys.exit(1)
         
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    # Batch size same as training since validation sequences are now cropped to chunk_size
+    # Batch size same as training since validation sequences are cropped to chunk_size
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
     # Set up model
@@ -900,82 +1095,159 @@ def main():
         evaluate_model(model, val_loader, device, num_classes=args.num_classes)
         return
     else:
-        # Standard initialization for training (either custom num_bands/shape or auto-resuming shape if check-point exists)
-        num_bands = args.num_bands
-        cnn_channels = args.cnn_channels
-        lstm_hidden = args.lstm_hidden
-        d_model = args.cnn_channels
-        
+        # Determine whether to load the existing checkpoint or train from scratch
+        choice = 'overwrite'
         if os.path.exists(args.save_path):
+            if args.on_exist == "load":
+                choice = 'load'
+            elif args.on_exist == "overwrite":
+                choice = 'overwrite'
+            else: # "ask"
+                if sys.stdin.isatty():
+                    try:
+                        while True:
+                            ans = input(f"Model checkpoint '{args.save_path}' already exists.\nLoad and continue training [L], or overwrite and train from scratch [O]? (L/O): ").strip().lower()
+                            if ans in ['l', 'load']:
+                                choice = 'load'
+                                break
+                            elif ans in ['o', 'overwrite']:
+                                choice = 'overwrite'
+                                break
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nNo user input received. Defaulting to loading existing checkpoint.")
+                        choice = 'load'
+                else:
+                    print(f"Non-interactive environment and --on_exist 'ask' (default) detected. Model checkpoint '{args.save_path}' already exists. Defaulting to loading checkpoint to continue training.")
+                    choice = 'load'
+
+        if choice == 'load':
+            print(f"Loading weights from existing checkpoint '{args.save_path}' to continue training...")
             try:
-                ckpt = torch.load(args.save_path, map_location='cpu')
-                if 'attention.fc_mel.0.weight' in ckpt:
-                    num_bands = ckpt['attention.fc_mel.0.weight'].shape[1]
-                if 'cnn.0.weight' in ckpt:
-                    cnn_channels = ckpt['cnn.0.weight'].shape[0]
-                if 'lstm.weight_ih_l0' in ckpt:
-                    lstm_hidden = ckpt['lstm.weight_ih_l0'].shape[0] // 4
-                if 'input_projection.weight' in ckpt:
-                    d_model = ckpt['input_projection.weight'].shape[0]
-                print(f"Auto-resuming: detected existing checkpoint. To preserve weights/shape, using: num_bands={num_bands}, cnn_channels={cnn_channels}, lstm_hidden={lstm_hidden}.")
-            except Exception:
-                pass
-                
-        # Determine input dimension dynamically from dataset features
-        input_dim = train_dataset[0][0].shape[1]
-        print(f"Initializing model with input_dim = {input_dim}")
-        
-        if model_class.__name__ == "CNNLSTMRhythmModel":
-            model = model_class(
-                input_dim=input_dim, 
-                num_classes=args.num_classes, 
-                num_bands=num_bands,
-                cnn_channels=cnn_channels,
-                lstm_hidden=lstm_hidden
-            ).to(device)
-        elif model_class.__name__ == "CNNTransformerRhythmModel":
-            model = model_class(
-                input_dim=input_dim, 
-                num_classes=args.num_classes, 
-                num_bands=num_bands,
-                cnn_channels=cnn_channels,
-                d_model=d_model
-            ).to(device)
+                model = load_model_helper(model_class, args.save_path, device, num_classes=args.num_classes, default_num_bands=args.num_bands)
+            except Exception as e:
+                print(f"Failed to load checkpoint: {e}. Exiting.")
+                sys.exit(1)
         else:
-            model = model_class(
-                input_dim=input_dim, 
-                num_classes=args.num_classes, 
-                num_bands=num_bands
-            ).to(device)
+            # Standard initialization for training from scratch
+            num_bands = args.num_bands
+            cnn_channels = args.cnn_channels
+            lstm_hidden = args.lstm_hidden
+            d_model = args.cnn_channels
+            
+            # Determine input dimension dynamically from dataset features
+            input_dim = train_dataset[0][0].shape[1]
+            print(f"Initializing new model with input_dim = {input_dim}")
+            
+            if model_class.__name__ == "CNNLSTMRhythmModel":
+                model = model_class(
+                    input_dim=input_dim, 
+                    num_classes=args.num_classes, 
+                    num_bands=num_bands,
+                    cnn_channels=cnn_channels,
+                    lstm_hidden=lstm_hidden
+                ).to(device)
+            elif model_class.__name__ == "CNNTransformerRhythmModel":
+                model = model_class(
+                    input_dim=input_dim, 
+                    num_classes=args.num_classes, 
+                    num_bands=num_bands,
+                    cnn_channels=cnn_channels,
+                    d_model=d_model
+                ).to(device)
+            else:
+                model = model_class(
+                    input_dim=input_dim, 
+                    num_classes=args.num_classes, 
+                    num_bands=num_bands
+                ).to(device)
         
     # Compute class weights to address label imbalance
-    print("Computing class weights...")
-    try:
-        class_weights = compute_class_weights(
-            train_dataset, 
-            num_classes=args.num_classes, 
-            max_weight=args.max_weight, 
-            method=args.weight_method
-        )
-        print(f"Class weights: {class_weights.numpy()}")
-        class_weights = class_weights.to(device)
-    except Exception as e:
-        print(f"Failed to compute class weights: {e}. Using uniform weights.")
-        if args.num_classes == 5:
-            class_weights = torch.tensor([1.0, 10.0, 10.0, 10.0, 10.0]).to(device)
+    if args.custom_weights is not None:
+        print(f"Using custom class weights: {args.custom_weights}")
+        if len(args.custom_weights) != args.num_classes:
+            print(f"Warning: --custom_weights length ({len(args.custom_weights)}) does not match --num_classes ({args.num_classes}).")
+        class_weights = torch.tensor(args.custom_weights, dtype=torch.float32).to(device)
+        no_onset_w = args.custom_weights[0]
+        if len(args.custom_weights) > 1:
+            onset_w = sum(args.custom_weights[1:]) / len(args.custom_weights[1:])
         else:
-            class_weights = torch.tensor([1.0, 10.0, 10.0, 10.0, 10.0, 15.0, 15.0, 15.0, 15.0]).to(device)
+            onset_w = 1.0
+        onset_weights = torch.tensor([no_onset_w, onset_w], dtype=torch.float32).to(device)
+        print(f"Calculated onset weights from custom weights: {onset_weights.cpu().numpy()}")
+    elif args.weight_method == "none":
+        print("Class weights disabled (using uniform weights).")
+        class_weights = None
+        onset_weights = None
+    else:
+        print("Computing class weights...")
+        try:
+            class_weights, onset_weights = compute_class_weights(
+                train_dataset, 
+                num_classes=args.num_classes, 
+                max_weight=args.max_weight, 
+                method=args.weight_method
+            )
+            print(f"Class weights: {class_weights.numpy()}")
+            print(f"Onset weights: {onset_weights.numpy()}")
+            class_weights = class_weights.to(device)
+            onset_weights = onset_weights.to(device)
+        except Exception as e:
+            print(f"Failed to compute class weights: {e}. Using fallback weights.")
+            if args.num_classes == 5:
+                class_weights = torch.tensor([1.0, 2.5, 2.6, 4.0, 5.0]).to(device)
+            elif args.num_classes == 6:
+                class_weights = torch.tensor([1.0, 2.5, 2.6, 2.6, 5.0, 4.0]).to(device)
+            elif args.num_classes == 8:
+                class_weights = torch.tensor([1.0, 2.5, 2.6, 2.6, 5.0, 4.0, 4.0, 4.0]).to(device)
+            else:
+                class_weights = torch.tensor([1.0, 2.5, 2.6, 2.6, 5.0, 4.0, 4.0, 4.0, 4.0]).to(device)
+            
+            # Cap fallback class weights
+            if args.max_weight is not None:
+                class_weights = torch.minimum(class_weights, torch.tensor(args.max_weight, device=device))
+            
+            # Fallback onset weights (imbalanced binary classification)
+            onset_weights = torch.tensor([1.0, min(3.0, args.max_weight)]).to(device)
         
     if args.use_focal_loss:
         print(f"Using Focal Loss (gamma={args.focal_gamma})")
-        criterion = FocalLoss(weight=class_weights, gamma=args.focal_gamma, label_smoothing=args.label_smoothing)
+        criterion_onset = FocalLoss(weight=onset_weights, gamma=args.focal_gamma, label_smoothing=args.label_smoothing)
+        type_weights = class_weights[1:] if class_weights is not None else None
     else:
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
+        criterion_onset = nn.CrossEntropyLoss(weight=onset_weights, label_smoothing=args.label_smoothing)
+        type_weights = class_weights[1:] if class_weights is not None else None
+        
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
+    # Count difficulty and style distributions
+    diff_counts = [0] * 5
+    style_counts = [0] * 3
+    print("Analyzing difficulty and style distribution in training dataset...")
+    for pair in train_dataset.valid_pairs:
+        timing_points, hit_objects, _ = OsuBeatmapParser.parse(pair['map_path'])
+        hit_objects = assign_pattern_labels(hit_objects, timing_points)
+        meta_vec, _, _ = get_map_metadata_vector(pair['map_path'], timing_points, hit_objects, sr=train_dataset.sr, hop_length=train_dataset.hop_length)
+        diff_idx = np.argmax(meta_vec[:5])
+        style_idx = np.argmax(meta_vec[5:])
+        diff_counts[diff_idx] += 1
+        style_counts[style_idx] += 1
+        
+    diff_labels = ["1-3*", "3-4.5*", "4.5-6*", "6-8*", "8-10+*"]
+    style_labels = ["stream", "jump", "tech"]
+    print("Difficulty distribution:")
+    for l, c in zip(diff_labels, diff_counts):
+        print(f"  {l}: {c}")
+    print("Style distribution:")
+    for l, c in zip(style_labels, style_counts):
+        print(f"  {l}: {c}")
+
     print(f"\nStarting training on {len(train_dataset)} beatmaps...")
     best_loss = float('inf')
+    best_onset_f1 = 0.0
+    patience_counter = 0
+    
+    import torch.nn.functional as F
     
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -983,13 +1255,15 @@ def main():
         
         # Put dataset in training mode for random crops
         train_dataset.is_train = True
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion_onset, device, type_weights=type_weights, label_smoothing=args.label_smoothing, clip_grad=args.clip_grad)
         
         # Put dataset in validation mode for full sequences
         train_dataset.is_train = False
         
-        # Compute validation loss
+        # Compute validation loss and metrics
         val_loss = 0
+        all_preds = []
+        all_targets = []
         model.eval()
         total_val = len(val_loader)
         print("  Evaluating on validation set...")
@@ -999,24 +1273,79 @@ def main():
                     print(f"    Val file {idx}/{total_val}...")
                 features = features.to(device)
                 labels = labels.to(device)
-                logits = model(features)
-                loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                logits_onset, logits_type = model(features)
+                
+                # Compute onset loss
+                target_onset = (labels > 0).long()
+                loss_onset = criterion_onset(logits_onset.view(-1, 2), target_onset.view(-1))
+                
+                # Compute type loss with Binary Mask multiplication
+                mask = (labels > 0).float().view(-1)
+                target_type = torch.clamp(labels - 1, min=0).view(-1)
+                
+                loss_type_elementwise = F.cross_entropy(
+                    logits_type.view(-1, logits_type.size(-1)),
+                    target_type,
+                    weight=type_weights,
+                    reduction='none',
+                    label_smoothing=args.label_smoothing
+                )
+                
+                if mask.sum() > 0:
+                    loss_type = (loss_type_elementwise * mask).sum() / mask.sum()
+                else:
+                    loss_type = torch.tensor(0.0, device=device)
+                    
+                loss = loss_onset + loss_type
                 val_loss += loss.item()
+                
+                # Collect predictions for F1 metric
+                probs_onset = torch.softmax(logits_onset, dim=-1)
+                probs_type = torch.softmax(logits_type, dim=-1)
+                
+                # Hierarchical prediction: onset exists if P(onset) >= 0.5
+                pred_onset = torch.argmax(probs_onset, dim=-1)
+                pred_type = torch.argmax(probs_type, dim=-1) + 1
+                preds = torch.where(pred_onset > 0, pred_type, torch.zeros_like(pred_onset))
+                
+                all_preds.extend(preds.view(-1).cpu().numpy())
+                all_targets.extend(labels.view(-1).cpu().numpy())
+                
         val_loss /= len(val_loader)
+        
+        # Calculate Validation F1 scores
+        all_preds = np.array(all_preds)
+        all_targets = np.array(all_targets)
+        val_macro_f1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
+        val_weighted_f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
+        val_onset_f1 = f1_score((all_targets > 0).astype(int), (all_preds > 0).astype(int), average='binary', zero_division=0)
         
         # Update learning rate
         scheduler.step()
         
         elapsed = time.time() - t0
-        print(f"Epoch {epoch:2d}/{args.epochs:2d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.6f} | Time: {elapsed:.1f}s")
+        print(f"Epoch {epoch:2d}/{args.epochs:2d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Onset F1: {val_onset_f1:.4f} | Val Macro F1: {val_macro_f1:.4f} | Val Weighted F1: {val_weighted_f1:.4f} | LR: {current_lr:.6f} | Time: {elapsed:.1f}s")
         
-        # Save best checkpoint
-        if val_loss < best_loss:
-            best_loss = val_loss
+        # 1. Save best checkpoint based on highest Validation Onset F1 (for bolder note transcription)
+        if val_onset_f1 > best_onset_f1:
+            best_onset_f1 = val_onset_f1
             state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             torch.save(state_dict, args.save_path)
+            print(f"  Validation Onset F1 improved to {val_onset_f1:.4f}. Saved checkpoint to '{args.save_path}'")
             
-    print(f"\nTraining completed! Best Validation Loss: {best_loss:.4f}")
+        # 2. Handle early stopping based on Validation Loss (for stable convergence tracking)
+        if val_loss < best_loss:
+            best_loss = val_loss
+            patience_counter = 0
+            print(f"  Validation loss improved to {val_loss:.4f}.")
+        else:
+            patience_counter += 1
+            print(f"  Validation loss did not improve. Early stopping counter: {patience_counter}/{args.patience}")
+            if patience_counter >= args.patience:
+                print(f"\nEarly stopping triggered! Training stopped after {epoch} epochs.")
+                break
+            
+    print(f"\nTraining completed! Best Validation Loss: {best_loss:.4f} | Best Validation Onset F1: {best_onset_f1:.4f}")
     print(f"Model saved to '{args.save_path}'")
     
     # Run final evaluation

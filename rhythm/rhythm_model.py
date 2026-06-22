@@ -92,9 +92,8 @@ class BandChannelAttention(nn.Module):
 
 class CNNLSTMRhythmModel(nn.Module):
     """
-    CNN-LSTM architecture for rhythm transcription.
-    Applies 1D convolutions over the frame-wise input features,
-    followed by a bidirectional LSTM and linear projection to event classes.
+    CNN-LSTM architecture for rhythm transcription with multi-task heads.
+    Determines if a note exists (fc_onset) and classifies the note type (fc_type).
     """
     def __init__(self, input_dim=85, cnn_channels=128, lstm_hidden=128, lstm_layers=2, num_classes=5, dropout=0.2, num_bands=3):
         super(CNNLSTMRhythmModel, self).__init__()
@@ -127,12 +126,19 @@ class CNNLSTMRhythmModel(nn.Module):
             dropout=dropout if lstm_layers > 1 else 0.0
         )
         
-        # Classification head
-        self.fc = nn.Sequential(
+        # Multi-task heads
+        self.fc_onset = nn.Sequential(
             nn.Linear(lstm_hidden * 2, lstm_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(lstm_hidden, num_classes)
+            nn.Linear(lstm_hidden, 2) # Binary: None (0) or Note exists (1)
+        )
+        
+        self.fc_type = nn.Sequential(
+            nn.Linear(lstm_hidden * 2, lstm_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden, num_classes - 1) # Note type classification (Circle, Slider, etc.)
         )
 
     def forward(self, x):
@@ -151,15 +157,14 @@ class CNNLSTMRhythmModel(nn.Module):
         with torch.backends.cudnn.flags(enabled=False):
             lstm_out, _ = self.lstm(lstm_in)
         
-        # Output classification: (batch_size, seq_len, num_classes)
-        logits = self.fc(lstm_out)
-        return logits
+        # Multi-task outputs
+        logits_onset = self.fc_onset(lstm_out)
+        logits_type = self.fc_type(lstm_out)
+        return logits_onset, logits_type
 
 class TransformerRhythmModel(nn.Module):
     """
-    Transformer Encoder architecture for rhythm transcription.
-    Applies linear projection, positional encoding, and a Transformer
-    Encoder stack, followed by linear projection to event classes.
+    Transformer Encoder architecture for rhythm transcription with multi-task heads.
     """
     def __init__(self, input_dim=85, d_model=128, nhead=4, num_layers=3, dim_feedforward=256, num_classes=5, dropout=0.1, num_bands=3, cnn_channels=0, lstm_hidden = 0):
         super(TransformerRhythmModel, self).__init__()
@@ -178,11 +183,18 @@ class TransformerRhythmModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        self.fc = nn.Sequential(
+        self.fc_onset = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_classes)
+            nn.Linear(d_model // 2, 2)
+        )
+        
+        self.fc_type = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_classes - 1)
         )
 
     def forward(self, x):
@@ -194,16 +206,13 @@ class TransformerRhythmModel(nn.Module):
         
         trans_out = self.transformer_encoder(x_pos)
         
-        # Output classification: (batch_size, seq_len, num_classes)
-        logits = self.fc(trans_out)
-        return logits
+        logits_onset = self.fc_onset(trans_out)
+        logits_type = self.fc_type(trans_out)
+        return logits_onset, logits_type
 
 class CNNTransformerRhythmModel(nn.Module):
     """
-    CNN-Transformer architecture for rhythm transcription.
-    Applies 1D convolutions over the frame-wise input features,
-    followed by positional encoding and a Transformer Encoder stack,
-    projecting to event classes.
+    CNN-Transformer architecture for rhythm transcription with multi-task heads.
     """
     def __init__(self, input_dim=85, cnn_channels=128, d_model=128, nhead=4, num_layers=3, dim_feedforward=256, num_classes=5, dropout=0.1, num_bands=3):
         super(CNNTransformerRhythmModel, self).__init__()
@@ -238,11 +247,18 @@ class CNNTransformerRhythmModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        self.fc = nn.Sequential(
+        self.fc_onset = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_classes)
+            nn.Linear(d_model // 2, 2)
+        )
+        
+        self.fc_type = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_classes - 1)
         )
 
     def forward(self, x):
@@ -262,9 +278,9 @@ class CNNTransformerRhythmModel(nn.Module):
         
         trans_out = self.transformer_encoder(x_pos)
         
-        # Output classification: (batch_size, seq_len, num_classes)
-        logits = self.fc(trans_out)
-        return logits
+        logits_onset = self.fc_onset(trans_out)
+        logits_type = self.fc_type(trans_out)
+        return logits_onset, logits_type
 
 def load_model_helper(model_class, checkpoint_path, device, num_classes, input_dim=169, default_num_bands=3):
     num_bands = default_num_bands

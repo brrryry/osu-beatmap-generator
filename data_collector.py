@@ -41,12 +41,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 
-NUM_MAPS = 1500
+NUM_MAPS = 2500
 
 # Event used to signal all threads to stop gracefully
 stop_event = threading.Event()
 processed_lock = threading.Lock()
-processed_maps_file = "processed_maps.txt"
+processed_maps_file = "data/processed_maps.txt"
 processed_map_ids = set()
 
 # Load processed maps
@@ -370,6 +370,17 @@ def fetch_maps(num_maps = NUM_MAPS, difficulty_threshold = 5.0):
         
 
 if __name__ == "__main__":
+    # Set up command line argument parsing
+    import argparse
+    parser = argparse.ArgumentParser(description="osu! beatmap dataset collector")
+    parser.add_argument(
+        "--num_maps",
+        type=int,
+        default=NUM_MAPS,
+        help=f"Number of maps to collect (default: {NUM_MAPS})"
+    )
+    args = parser.parse_args()
+
     # Register signal handlers for SIGINT (Ctrl+C) and SIGTERM (graceful shutdown)
     try:
         signal.signal(signal.SIGINT, signal_handler)
@@ -378,7 +389,7 @@ if __name__ == "__main__":
         # signal only works in main thread (e.g. might fail if run in notebook/subthread)
         pass
 
-    logger.info("Starting the data collection process!")
+    logger.info(f"Starting the data collection process! Target maps count: {args.num_maps}")
     # create folders
     if not os.path.exists(extract_path_maps):
         os.makedirs(extract_path_maps)
@@ -389,7 +400,7 @@ if __name__ == "__main__":
 
     try:
         # fetch maps
-        fetch_maps()
+        fetch_maps(num_maps=args.num_maps)
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt caught in main thread. Stopping gracefully...")
         print("\nKeyboardInterrupt caught. Stopping gracefully...")
